@@ -1,24 +1,22 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
+const fs = require('fs');
+const { execSync } = require('child_process');
 
 // Configuration
-const token = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN';
-const chatId = process.env.TELEGRAM_CHAT_ID || 'YOUR_CHAT_ID';
-const ankrApiUrl = 'https://rpc.ankr.com/multichain';
-const blockchainId = process.env.BLOCKCHAIN_ID || 'eth'; // 'eth', 'bsc', 'polygon', etc.
+const token = process.env.TELEGRAM_BOT_TOKEN || '8242352167:AAGAOZMDNdhhrDSPg7hxvjJyZXrbvo474ZI';
+const chatId = process.env.TELEGRAM_CHAT_ID || '7760381935';
 
 // Multi-wallet storage
-const wallets = {}; // Format: { address: { chain: 'eth', lastBalance: '0' } }
+const wallets = {}; // Format: { address: { chain: 'eth', lastUsd: 0 } }
 
 // Load initial wallets from environment or use defaults
 function initializeWallets() {
-  const initialAddress = process.env.EVM_ADDRESS;
-  if (initialAddress && initialAddress !== 'YOUR_EVM_ADDRESS') {
-    wallets[initialAddress] = {
-      chain: blockchainId,
-      lastBalance: null
-    };
+  try {
+    const storedWallets = fs.readFileSync('wallets.json', 'utf8');
+    Object.assign(wallets, JSON.parse(storedWallets));
+  } catch (err) {
+    console.log('No existing wallets.json found, starting fresh.');
   }
 }
 
@@ -26,67 +24,17 @@ function initializeWallets() {
 const bot = new TelegramBot(token, { polling: true });
 
 /**
- * Get EVM account balance using Ankr Token API
+ * Get EVM account balance using Python camousfox script
  * @param {string} address - EVM wallet address
- * @param {string} chain - Blockchain ID (eth, bsc, polygon, etc.)
- * @returns {Promise<Object>} Balance information with assets array
+ * @returns {string} Balance information
  */
-async function getAccountBalance(address, chain) {
+function getAccountBalance(address) {
   try {
-    const response = await axios.post(ankrApiUrl, {
-      jsonrpc: '2.0',
-      method: 'ankr_getAccountBalance',
-      params: {
-        blockchain: chain,
-        walletAddress: address
-      },
-      id: 1
-    }, {
-      headers: { 'Content-Type': 'application/json' }
-    });
-
-    if (response.data.error) {
-      throw new Error(response.data.error.message);
-    }
-
-    return response.data.result;
+    let balance = execSync('python fetch_balance.py ' + address);
+    return balance.toString().trim().replace('$', '');
   } catch (error) {
-    console.error('Error fetching balance from Ankr API:', error.message);
-    throw error;
+    throw new Error(`Failed to fetch balance for ${address}: ${error.message}`);
   }
-}
-
-/**
- * Extract native token balance from Ankr API response
- * @param {Object} balanceData - Balance data from Ankr API
- * @returns {string} Native token balance
- */
-function getNativeTokenBalance(balanceData) {
-  if (!balanceData || !balanceData.assets || balanceData.assets.length === 0) {
-    return '0';
-  }
-
-  // Find the native token (first asset is usually native token)
-  const nativeAsset = balanceData.assets.find(asset => asset.contractAddress === null);
-  
-  if (nativeAsset && nativeAsset.balance) {
-    return nativeAsset.balance;
-  }
-
-  // Fallback to first asset if native not found
-  return balanceData.assets[0].balance || '0';
-}
-
-/**
- * Get USD value of account
- * @param {Object} balanceData - Balance data from Ankr API
- * @returns {string} Total balance in USD
- */
-function getUSDBalance(balanceData) {
-  if (!balanceData || !balanceData.totalBalanceUsd) {
-    return '0';
-  }
-  return balanceData.totalBalanceUsd;
 }
 
 /**
@@ -103,32 +51,30 @@ async function checkBalance() {
   for (const address of addresses) {
     try {
       const walletInfo = wallets[address];
-      const balanceData = await getAccountBalance(address, walletInfo.chain);
-      const currentBalance = getNativeTokenBalance(balanceData);
-      const currentUSD = getUSDBalance(balanceData);
-      const assetCount = balanceData.assets ? balanceData.assets.length : 0;
+      const balance = getAccountBalance(address);
+      const currentUSD = parseFloat(balance);
+      if (walletInfo.lastUsd !== null && walletInfo.lastUsd !== undefined) {
+        if (parseFloat(balance) !== parseFloat(walletInfo.lastUsd)) {
 
-      if (walletInfo.lastBalance !== null && currentBalance !== walletInfo.lastBalance) {
-        const balanceChangeText = parseFloat(currentBalance) > parseFloat(walletInfo.lastBalance) 
-          ? '📈 Increased' 
-          : '📉 Decreased';
-        
-        const message = `${balanceChangeText} - Wallet balance changed!\n` +
-                        `Blockchain: ${walletInfo.chain.toUpperCase()}\n` +
-                        `Address: ${address.substring(0, 10)}...${address.substring(address.length - 8)}\n` +
-                        `Previous: ${walletInfo.lastBalance}\n` +
-                        `Current: ${currentBalance}\n` +
-                        `USD Value: $${currentUSD}\n` +
-                        `Total Assets: ${assetCount}\n` +
-                        `Timestamp: ${new Date().toLocaleString()}`;
-        
-        await bot.sendMessage(chatId, message);
-        console.log('Notification sent:', message);
-      } else if (walletInfo.lastBalance === null) {
-        console.log(`Initial balance retrieved for ${address.substring(0, 10)}...: ${currentBalance}`);
+          const increased = currentUSD > walletInfo.lastUsd;
+          const diff = Math.abs(currentUSD - walletInfo.lastUsd);
+          const pct = ((diff / walletInfo.lastUsd) * 100).toFixed(2);
+
+          const message = `${increased ? '📈 Increased' : '📉 Decreased'} - Wallet net worth changed!\n` +
+                          `Address: ${address}\n` +
+                          `Previous (USD): $${Number(walletInfo.lastUsd).toFixed(2)}\n` +
+                          `Current (USD): $${currentUSD.toFixed(2)}\n` +
+                          `Change: $${diff} (${pct}%)\n` +
+                          `Timestamp: ${new Date().toLocaleString()}`;
+
+          await bot.sendMessage(chatId, message);
+          console.log('Notification sent:', message);
+        }
+      } else {
+        console.log(`Initial USD balance retrieved for ${address}: $${currentUSD.toFixed(2)}`);
       }
 
-      walletInfo.lastBalance = currentBalance;
+      walletInfo.lastUsd = currentUSD;
     } catch (error) {
       console.error(`Error checking balance for ${address}:`, error.message);
     }
@@ -143,14 +89,13 @@ async function initializeMonitoring() {
   
   console.log('🤖 Telegram Bot started!');
   console.log(`📊 Monitoring ${Object.keys(wallets).length} wallet(s)`);
-  console.log(`⛓️ Default Blockchain: ${blockchainId}`);
   console.log(`⏱️ Check interval: 30 seconds\n`);
   
   // Perform initial check
   await checkBalance();
   
   // Check balance every 30 seconds (adjust as needed)
-  setInterval(checkBalance, 30000);
+  setInterval(checkBalance, 300000);
 }
 
 // Bot command: /start
@@ -164,7 +109,6 @@ bot.onText(/\/start/, (msg) => {
     '/listwallet - List all monitored wallets\n\n' +
     'Commands:\n' +
     '/balance [address] - Get wallet balance (all if no address)\n' +
-    '/status - Check monitoring status\n' +
     '/help - Show this message'
   );
 });
@@ -198,17 +142,10 @@ bot.onText(/\/balance(?:\s+(.+))?/, async (msg, match) => {
     
     for (const address of addresses) {
       try {
-        const walletInfo = wallets[address];
-        const balanceData = await getAccountBalance(address, walletInfo.chain);
-        const balance = getNativeTokenBalance(balanceData);
-        const usdValue = getUSDBalance(balanceData);
-        const assetCount = balanceData.assets ? balanceData.assets.length : 0;
-        
+        const balance = getAccountBalance(address);
+
         response += `📍 ${address.substring(0, 10)}...${address.substring(address.length - 8)}\n`;
-        response += `Chain: ${walletInfo.chain.toUpperCase()}\n`;
-        response += `Balance: ${balance}\n`;
-        response += `USD: $${usdValue}\n`;
-        response += `Assets: ${assetCount}\n\n`;
+        response += `USD (total): $${Number(balance).toFixed(2)}\n`;
       } catch (error) {
         response += `📍 ${address.substring(0, 10)}...\n❌ Error: ${error.message}\n\n`;
       }
@@ -218,27 +155,6 @@ bot.onText(/\/balance(?:\s+(.+))?/, async (msg, match) => {
   } catch (error) {
     bot.sendMessage(chatIdFromMsg, `❌ Error fetching balance: ${error.message}`);
   }
-});
-
-// Bot command: /status
-bot.onText(/\/status/, (msg) => {
-  const chatIdFromMsg = msg.chat.id;
-  const walletCount = Object.keys(wallets).length;
-  let statusMsg = `✅ Bot Status: Running\n\n`;
-  statusMsg += `📊 Monitored Wallets: ${walletCount}\n`;
-  statusMsg += `⛓️ Default Chain: ${blockchainId}\n`;
-  statusMsg += `⏱️ Check Interval: 30 seconds\n\n`;
-  
-  if (walletCount > 0) {
-    statusMsg += 'Wallets:\n';
-    Object.entries(wallets).forEach(([addr, info]) => {
-      statusMsg += `• ${addr.substring(0, 10)}... (${info.chain}) - Balance: ${info.lastBalance || 'pending'}\n`;
-    });
-  } else {
-    statusMsg += '❌ No wallets monitored yet.\n';
-  }
-  
-  bot.sendMessage(chatIdFromMsg, statusMsg);
 });
 
 // Bot command: /addwallet <address>
@@ -257,14 +173,17 @@ bot.onText(/\/addwallet\s+(.+)/, async (msg, match) => {
   }
   
   try {
-    await getAccountBalance(address, blockchainId);
-    
+    let balance = getAccountBalance(address);
+
     wallets[address] = {
-      chain: blockchainId,
-      lastBalance: null
+      lastUsd: balance
     };
-    
-    bot.sendMessage(chatIdFromMsg, `✅ Wallet added!\n${address}\nChain: ${blockchainId}`);
+    //add wallet address into file or database here
+    fs.writeFileSync('wallets.json', '{}');
+    const walletData = JSON.stringify(wallets, null, 2);
+    fs.writeFileSync('wallets.json', walletData);
+
+    bot.sendMessage(chatIdFromMsg, `✅ Wallet added!\n${address}`);
     console.log(`Wallet added: ${address}`);
   } catch (error) {
     bot.sendMessage(chatIdFromMsg, `❌ Error adding wallet: ${error.message}`);
@@ -279,6 +198,11 @@ bot.onText(/\/removewallet\s+(.+)/, (msg, match) => {
   
   if (found) {
     delete wallets[found];
+
+    fs.writeFileSync('wallets.json', '{}');
+    const walletData = JSON.stringify(wallets, null, 2);
+    fs.writeFileSync('wallets.json', walletData);
+
     bot.sendMessage(chatIdFromMsg, `✅ Wallet removed!\n${found}`);
     console.log(`Wallet removed: ${found}`);
   } else {
@@ -298,7 +222,7 @@ bot.onText(/\/listwallet/, (msg) => {
   
   let response = `📋 Monitored Wallets (${addresses.length}):\n\n`;
   addresses.forEach((addr, idx) => {
-    response += `${idx + 1}. ${addr}\n   Chain: ${wallets[addr].chain}\n\n`;
+    response += `${idx + 1}. ${addr}\n`;
   });
   
   bot.sendMessage(chatIdFromMsg, response);
@@ -315,7 +239,6 @@ bot.onText(/\/help/, (msg) => {
     '/listwallet - List all wallets\n\n' +
     '📊 Queries:\n' +
     '/balance [address] - Get balance(s)\n' +
-    '/status - Bot status\n' +
     '/start - Welcome message\n' +
     '/help - This message'
   );
